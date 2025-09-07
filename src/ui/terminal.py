@@ -5,9 +5,10 @@ Provides a beautiful command-line interface for the dictation application
 with real-time feedback, progress indicators, and result comparison.
 """
 
-from typing import List, Optional, Callable
+from typing import List, Optional
+import asyncio
 import time
-from pathlib import Path
+import sys
 
 try:
     from rich.console import Console
@@ -16,7 +17,6 @@ try:
     from rich.text import Text
     from rich.table import Table
     from rich.prompt import Prompt, Confirm
-    from rich.layout import Layout
     from rich.live import Live
     from rich import box
     RICH_AVAILABLE = True
@@ -24,29 +24,35 @@ except ImportError:
     RICH_AVAILABLE = False
     Console = None
 
-from ..cleanup.cleaner import MultiCleanupResult, CleanupStrategy
 from ..cleanup.providers import CleanupResult
-from ..audio.transcriber import TranscriptionResult
 
 
 class TerminalUI:
     """
     Rich-based terminal interface for the dictation application.
     
-    Provides an interactive command-line experience with real-time feedback,
+    Provides an async interactive command-line experience with real-time feedback,
     progress indicators, and side-by-side result comparison.
     """
     
-    def __init__(self):
+    def __init__(self, console: Optional[Console] = None):
         """Initialize the terminal UI."""
         if not RICH_AVAILABLE:
             raise RuntimeError("Rich library not available. Install with: pip install rich")
         
-        self.console = Console()
+        self.console = console or Console()
         self._recording_start_time: Optional[float] = None
+        self._progress_context = None
+        self._current_task = None
     
-    def show_welcome(self) -> None:
-        """Display welcome message and instructions."""
+    async def prompt_start_recording(self) -> bool:
+        """
+        Prompt user to start recording.
+        
+        Returns:
+            True if user wants to start recording, False otherwise.
+        """
+        # Show welcome message and instructions
         welcome_text = Text()
         welcome_text.append("🎙️  LLM Dictation", style="bold magenta")
         welcome_text.append("\n\nAI-powered speech-to-text with intelligent cleanup\n")
@@ -66,9 +72,26 @@ class TerminalUI:
         self.console.print("  • Press [bold red]Enter[/bold red] again to stop")
         self.console.print("  • Compare and select your preferred cleanup")
         self.console.print()
+        
+        # Use asyncio-friendly input
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, 
+                lambda: input("Press Enter to start recording (or Ctrl+C to quit): ")
+            )
+            return True
+        except KeyboardInterrupt:
+            return False
+        except EOFError:
+            return False
     
-    def show_recording_start(self) -> None:
-        """Show recording started message."""
+    async def show_recording_status(self) -> None:
+        """
+        Display recording status with visual indicators.
+        
+        Shows the recording indicator and waits for user to stop.
+        """
         self._recording_start_time = time.time()
         
         panel = Panel(
@@ -81,68 +104,82 @@ class TerminalUI:
         
         self.console.print(panel)
     
-    def show_recording_stop(self) -> None:
-        """Show recording stopped message."""
-        if self._recording_start_time:
-            duration = time.time() - self._recording_start_time
-            self.console.print(f"⏹️  Recording stopped ({duration:.1f}s)")
-        else:
-            self.console.print("⏹️  Recording stopped")
-        
-        self.console.print()
-    
-    def show_transcription_progress(self) -> 'TranscriptionProgress':
-        """Show transcription progress indicator."""
-        return TranscriptionProgress(self.console)
-    
-    def show_transcription_result(self, result: TranscriptionResult) -> None:
-        """Display the raw transcription result."""
-        self.console.print("\n📝 Raw Transcription:")
-        
-        # Create transcription panel
-        transcription_text = Text(result.text, style="white")
-        
-        panel = Panel(
-            transcription_text,
-            title="Speech-to-Text Result",
-            title_align="left",
-            border_style="blue",
-            padding=(1, 2)
-        )
-        
-        self.console.print(panel)
-        
-        # Show metadata
-        if result.language or result.duration or result.processing_time:
-            metadata = []
-            if result.language:
-                metadata.append(f"Language: {result.language}")
-            if result.duration:
-                metadata.append(f"Duration: {result.duration:.1f}s")
-            if result.processing_time:
-                metadata.append(f"Processing: {result.processing_time:.1f}s")
-            
-            self.console.print(f"ℹ️  {' | '.join(metadata)}", style="dim")
-        
-        self.console.print()
-    
-    def show_cleanup_progress(self) -> 'CleanupProgress':
-        """Show cleanup progress indicator."""
-        return CleanupProgress(self.console)
-    
-    def show_cleanup_results(self, result: MultiCleanupResult) -> Optional[CleanupResult]:
+    async def prompt_stop_recording(self) -> bool:
         """
-        Display cleanup results and let user select preferred version.
+        Wait for user to stop recording.
+        
+        Returns:
+            True when user presses Enter to stop.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, input)  # Wait for Enter
+            
+            # Show recording stopped message
+            if self._recording_start_time:
+                duration = time.time() - self._recording_start_time
+                self.console.print(f"⏹️  Recording stopped ({duration:.1f}s)")
+            else:
+                self.console.print("⏹️  Recording stopped")
+            
+            self.console.print()
+            return True
+        except KeyboardInterrupt:
+            return False
+        except EOFError:
+            return False
+    
+    async def show_transcription_progress(self, message: str) -> None:
+        """
+        Display transcription progress with message.
         
         Args:
-            result: MultiCleanupResult with all provider results
+            message: Progress message to display
+        """
+        if not self._progress_context:
+            self._progress_context = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TimeElapsedColumn(),
+                console=self.console
+            )
+            self._progress_context.__enter__()
+            self._current_task = self._progress_context.add_task(f"🤖 {message}", total=None)
+        else:
+            # Update existing progress
+            if self._current_task is not None:
+                self._progress_context.update(self._current_task, description=f"🤖 {message}")
+        
+        # Allow other async operations to run
+        await asyncio.sleep(0.1)
+    
+    def _stop_progress(self):
+        """Stop the current progress indicator."""
+        if self._progress_context:
+            try:
+                self._progress_context.__exit__(None, None, None)
+            except:
+                pass  # Ignore errors during cleanup
+            self._progress_context = None
+            self._current_task = None
+    
+    async def display_cleanup_results(self, results: List[CleanupResult]) -> int:
+        """
+        Display cleanup results and handle user selection.
+        
+        Args:
+            results: List of CleanupResult objects from different providers
             
         Returns:
-            Selected CleanupResult, or None if user cancelled
+            Index of selected result (0-based), or -1 if user cancelled
         """
-        if not result.results:
-            self.console.print("❌ No cleanup results available", style="red")
-            return None
+        # Stop any ongoing progress
+        self._stop_progress()
+        
+        if not results:
+            await self.show_error(Exception("No cleanup results available"))
+            return -1
         
         self.console.print("✨ Cleanup Results:")
         
@@ -162,91 +199,105 @@ class TerminalUI:
         table.add_column("Time", style="yellow", width=8)
         
         valid_results = []
-        for i, cleanup_result in enumerate(result.results):
-            if cleanup_result.error:
+        for i, result in enumerate(results):
+            if result.error:
                 # Show error results in red
                 table.add_row(
                     str(i + 1),
-                    cleanup_result.provider_name,
-                    f"[red]Error: {cleanup_result.error}[/red]",
+                    result.provider_name,
+                    f"[red]Error: {result.error}[/red]",
                     "N/A",
-                    f"{cleanup_result.processing_time:.1f}s"
+                    f"{result.processing_time:.1f}s"
                 )
             else:
-                valid_results.append((i + 1, cleanup_result))
-                confidence_str = f"{cleanup_result.confidence:.0%}" if cleanup_result.confidence else "N/A"
+                valid_results.append((i, result))
+                confidence_str = f"{result.confidence:.0%}" if result.confidence else "N/A"
                 
                 table.add_row(
                     str(i + 1),
-                    cleanup_result.provider_name,
-                    cleanup_result.cleaned_text,
+                    result.provider_name,
+                    result.cleaned_text,
                     confidence_str,
-                    f"{cleanup_result.processing_time:.1f}s"
+                    f"{result.processing_time:.1f}s"
                 )
         
         self.console.print(table)
         
         if not valid_results:
-            self.console.print("❌ No valid cleanup results", style="red")
-            return None
+            await self.show_error(Exception("No valid cleanup results"))
+            return -1
         
-        # Highlight best result
-        if result.best_result:
-            best_index = next(
-                (i for i, r in enumerate(result.results) if r == result.best_result),
-                None
-            )
-            if best_index is not None:
-                self.console.print(f"\n⭐ Recommended: Option {best_index + 1} ({result.best_result.provider_name})")
+        # Highlight best result (highest confidence)
+        best_result_idx = -1
+        best_confidence = 0.0
+        for idx, result in valid_results:
+            if result.confidence and result.confidence > best_confidence:
+                best_confidence = result.confidence
+                best_result_idx = idx
+        
+        if best_result_idx >= 0:
+            self.console.print(f"\n⭐ Recommended: Option {best_result_idx + 1} ({results[best_result_idx].provider_name})")
         
         self.console.print()
         
         # Get user selection
         while True:
             try:
-                choice = Prompt.ask(
-                    "Select your preferred version (number) or 'q' to quit",
-                    default="1" if result.best_result else None
+                loop = asyncio.get_event_loop()
+                choice = await loop.run_in_executor(
+                    None, 
+                    lambda: Prompt.ask(
+                        "Select your preferred version (number) or 'q' to quit",
+                        default=str(best_result_idx + 1) if best_result_idx >= 0 else "1"
+                    )
                 )
                 
                 if choice.lower() == 'q':
-                    return None
+                    return -1
                 
                 choice_num = int(choice)
-                if 1 <= choice_num <= len(result.results):
-                    selected_result = result.results[choice_num - 1]
+                if 1 <= choice_num <= len(results):
+                    selected_result = results[choice_num - 1]
                     if not selected_result.error:
                         self.console.print(f"✅ Selected: {selected_result.provider_name}", style="green")
-                        return selected_result
+                        return choice_num - 1  # Return 0-based index
                     else:
                         self.console.print("❌ Cannot select result with error", style="red")
                 else:
-                    self.console.print(f"❌ Please enter a number between 1 and {len(result.results)}", style="red")
+                    self.console.print(f"❌ Please enter a number between 1 and {len(results)}", style="red")
                     
             except ValueError:
                 self.console.print("❌ Please enter a valid number", style="red")
             except KeyboardInterrupt:
-                return None
+                return -1
+            except EOFError:
+                return -1
     
-    def show_clipboard_success(self, text: str) -> None:
-        """Show that text was successfully copied to clipboard."""
-        preview = text[:100] + "..." if len(text) > 100 else text
+    async def show_error(self, error: Exception) -> None:
+        """
+        Display error message with Rich formatting.
+        
+        Args:
+            error: Exception to display
+        """
+        # Stop any ongoing progress
+        self._stop_progress()
+        
+        error_message = str(error)
+        
+        # Provide helpful guidance for common errors
+        if "permission" in error_message.lower() or "audio" in error_message.lower():
+            guidance = "\n\n💡 Try checking your microphone permissions in System Preferences."
+        elif "network" in error_message.lower() or "api" in error_message.lower():
+            guidance = "\n\n💡 Check your internet connection and API keys."
+        elif "timeout" in error_message.lower():
+            guidance = "\n\n💡 Try again - the service might be temporarily slow."
+        else:
+            guidance = ""
         
         panel = Panel(
-            f"📋 Copied to clipboard!\n\n[dim]{preview}[/dim]",
-            title="Success",
-            title_align="center",
-            border_style="green",
-            padding=(1, 2)
-        )
-        
-        self.console.print(panel)
-    
-    def show_error(self, message: str, title: str = "Error") -> None:
-        """Show error message."""
-        panel = Panel(
-            Text(f"❌ {message}", style="red"),
-            title=title,
+            Text(f"❌ {error_message}{guidance}", style="red"),
+            title="Error",
             title_align="center",
             border_style="red",
             padding=(1, 2)
@@ -254,89 +305,32 @@ class TerminalUI:
         
         self.console.print(panel)
     
-    def show_info(self, message: str, title: str = "Info") -> None:
-        """Show info message."""
+    async def show_success(self, message: str) -> None:
+        """
+        Display success message with Rich formatting.
+        
+        Args:
+            message: Success message to display
+        """
+        # Stop any ongoing progress
+        self._stop_progress()
+        
+        # If it looks like clipboard content, show a preview
+        if len(message) > 100:
+            preview = message[:100] + "..."
+            content = f"📋 Copied to clipboard!\n\n[dim]{preview}[/dim]"
+        else:
+            content = f"✅ {message}"
+        
         panel = Panel(
-            Text(f"ℹ️  {message}", style="blue"),
-            title=title,
-            title_align="center", 
-            border_style="blue",
+            content,
+            title="Success",
+            title_align="center",
+            border_style="green",
             padding=(1, 2)
         )
         
         self.console.print(panel)
-    
-    def confirm_action(self, message: str) -> bool:
-        """Ask user for confirmation."""
-        return Confirm.ask(message)
-    
-    def wait_for_enter(self, message: str = "Press Enter to continue...") -> None:
-        """Wait for user to press Enter."""
-        Prompt.ask(message, default="")
-
-
-class TranscriptionProgress:
-    """Progress indicator for transcription."""
-    
-    def __init__(self, console: Console):
-        self.console = console
-        self._progress = None
-        self._task_id = None
-    
-    def __enter__(self):
-        """Start progress display."""
-        self._progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            console=self.console
-        )
-        self._progress.__enter__()
-        self._task_id = self._progress.add_task("🤖 Transcribing audio...", total=None)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Stop progress display."""
-        if self._progress:
-            self._progress.__exit__(exc_type, exc_val, exc_tb)
-    
-    def update(self, message: str) -> None:
-        """Update progress message."""
-        if self._progress and self._task_id is not None:
-            self._progress.update(self._task_id, description=f"🤖 {message}")
-
-
-class CleanupProgress:
-    """Progress indicator for text cleanup."""
-    
-    def __init__(self, console: Console):
-        self.console = console
-        self._progress = None
-        self._task_id = None
-    
-    def __enter__(self):
-        """Start progress display."""
-        self._progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            console=self.console
-        )
-        self._progress.__enter__()
-        self._task_id = self._progress.add_task("✨ Cleaning up text...", total=None)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Stop progress display."""
-        if self._progress:
-            self._progress.__exit__(exc_type, exc_val, exc_tb)
-    
-    def update(self, message: str) -> None:
-        """Update progress message."""
-        if self._progress and self._task_id is not None:
-            self._progress.update(self._task_id, description=f"✨ {message}")
 
 
 def create_terminal_ui() -> TerminalUI:
@@ -344,7 +338,7 @@ def create_terminal_ui() -> TerminalUI:
     return TerminalUI()
 
 
-def demo_ui() -> None:
+async def demo_ui() -> None:
     """Demo function to show UI capabilities."""
     if not RICH_AVAILABLE:
         print("Rich not available for demo")
@@ -352,24 +346,60 @@ def demo_ui() -> None:
     
     ui = TerminalUI()
     
-    ui.show_welcome()
-    ui.wait_for_enter("Press Enter to see recording demo...")
-    
-    ui.show_recording_start()
-    time.sleep(2)
-    ui.show_recording_stop()
-    
-    # Mock transcription progress
-    with ui.show_transcription_progress() as progress:
-        progress.update("Loading Whisper model...")
-        time.sleep(1)
-        progress.update("Processing audio...")
-        time.sleep(2)
-        progress.update("Generating transcription...")
-        time.sleep(1)
-    
-    ui.show_info("Demo complete!")
+    # Test the async interface
+    try:
+        # Test start recording prompt
+        start = await ui.prompt_start_recording()
+        if not start:
+            print("Demo cancelled")
+            return
+        
+        # Test recording status
+        await ui.show_recording_status()
+        
+        # Wait a moment then simulate stop
+        await asyncio.sleep(2)
+        await ui.prompt_stop_recording()
+        
+        # Test transcription progress
+        await ui.show_transcription_progress("Loading Whisper model...")
+        await asyncio.sleep(1)
+        await ui.show_transcription_progress("Processing audio...")
+        await asyncio.sleep(1)
+        await ui.show_transcription_progress("Generating transcription...")
+        await asyncio.sleep(1)
+        
+        # Test cleanup results with mock data
+        from ..cleanup.providers import CleanupResult
+        
+        mock_results = [
+            CleanupResult(
+                provider_name="openai",
+                original_text="Um, so like, this is a test, you know?",
+                cleaned_text="This is a test.",
+                confidence=0.9,
+                processing_time=1.2,
+                model_used="gpt-3.5-turbo"
+            ),
+            CleanupResult(
+                provider_name="claude",
+                original_text="Um, so like, this is a test, you know?",
+                cleaned_text="This is a test example.",
+                confidence=0.85,
+                processing_time=1.5,
+                model_used="claude-3-haiku"
+            )
+        ]
+        
+        selected = await ui.display_cleanup_results(mock_results)
+        if selected >= 0:
+            await ui.show_success(f"Selected result: {mock_results[selected].cleaned_text}")
+        
+    except KeyboardInterrupt:
+        print("\nDemo cancelled")
+    except Exception as e:
+        await ui.show_error(e)
 
 
 if __name__ == "__main__":
-    demo_ui()
+    asyncio.run(demo_ui())
