@@ -6,11 +6,14 @@ to clean up transcribed text with consistent input/output handling.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
-from enum import Enum
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
 import os
 import time
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
+import logging
 
 # Import statements that may fail if dependencies aren't installed
 try:
@@ -25,64 +28,103 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
-
-# Re-import from cleaner.py to avoid circular imports
-class CleanupStrategy(Enum):
-    """Different text cleanup strategies."""
-    CONSERVATIVE = "conservative"
-    BALANCED = "balanced"
-    AGGRESSIVE = "aggressive"
-
+# Setup logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class CleanupResult:
     """Result from a text cleanup operation."""
-    provider_name: str
     original_text: str
     cleaned_text: str
-    confidence: Optional[float] = None  # 0.0 to 1.0, higher is better
-    processing_time: float = 0.0
-    model_used: Optional[str] = None
-    tokens_used: Optional[int] = None
-    cost_estimate: Optional[float] = None
+    provider: str
+    processing_time: float
+    quality_score: float
     error: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-class LLMProvider(ABC):
-    """Abstract base class for LLM providers."""
+class CleanupProvider(ABC):
+    """Abstract base class for cleanup providers."""
     
     def __init__(self, name: str):
         self.name = name
+        self.usage_stats = {
+            'requests': 0,
+            'successful': 0,
+            'failed': 0,
+            'total_cost': 0.0,
+            'total_tokens': 0
+        }
+    
+    @abstractmethod
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
+        """Clean up the provided text."""
+        pass
+    
+    @abstractmethod
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        pass
     
     @abstractmethod
     def is_available(self) -> bool:
         """Check if this provider is available (API keys, models, etc.)."""
         pass
     
-    @abstractmethod
-    def cleanup_text(
-        self,
-        text: str,
-        strategy: CleanupStrategy = CleanupStrategy.BALANCED,
-        timeout: float = 30.0
-    ) -> Optional[CleanupResult]:
-        """
-        Clean up the provided text.
-        
-        Args:
-            text: Raw text to clean up
-            strategy: Cleanup strategy to use
-            timeout: Maximum time to wait for response
-            
-        Returns:
-            CleanupResult with cleaned text and metadata, or None if failed.
-        """
-        pass
+    def update_usage_stats(self, success: bool, cost: float = 0.0, tokens: int = 0):
+        """Update usage statistics."""
+        self.usage_stats['requests'] += 1
+        if success:
+            self.usage_stats['successful'] += 1
+        else:
+            self.usage_stats['failed'] += 1
+        self.usage_stats['total_cost'] += cost
+        self.usage_stats['total_tokens'] += tokens
     
-    def get_cleanup_prompt(self, strategy: CleanupStrategy) -> str:
-        """Get the system prompt for the specified cleanup strategy."""
-        base_prompt = """You are a professional editor helping to clean up transcribed speech. The text you receive is from speech-to-text software and may contain:
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """Get current usage statistics."""
+        return self.usage_stats.copy()
+    
+    def calculate_quality_score(self, original: str, cleaned: str) -> float:
+        """Calculate quality score for cleanup result."""
+        # Basic quality scoring based on improvement metrics
+        if not original.strip() or not cleaned.strip():
+            return 0.0
+        
+        # Measure improvements
+        original_words = len(original.split())
+        cleaned_words = len(cleaned.split())
+        
+        # Filler word reduction score
+        filler_words = ['um', 'uh', 'like', 'you know', 'so', 'well', 'actually']
+        original_fillers = sum(1 for word in original.lower().split() 
+                             if any(filler in word for filler in filler_words))
+        cleaned_fillers = sum(1 for word in cleaned.lower().split() 
+                            if any(filler in word for filler in filler_words))
+        
+        filler_reduction = max(0, (original_fillers - cleaned_fillers) / max(1, original_fillers))
+        
+        # Length optimization (not too short, not too long)
+        length_ratio = cleaned_words / max(1, original_words)
+        length_score = 1.0 if 0.7 <= length_ratio <= 1.1 else max(0, 1.0 - abs(length_ratio - 0.9))
+        
+        # Sentence structure (periods, capitals)
+        sentences_original = len(re.findall(r'[.!?]', original))
+        sentences_cleaned = len(re.findall(r'[.!?]', cleaned))
+        structure_score = min(1.0, sentences_cleaned / max(1, max(1, sentences_original)))
+        
+        # Weighted average of improvement metrics
+        quality_score = (
+            0.4 * filler_reduction +
+            0.3 * length_score +
+            0.3 * structure_score
+        )
+        
+        return min(1.0, max(0.0, quality_score))
+    
+    def get_cleanup_prompt(self) -> str:
+        """Get the system prompt for text cleanup."""
+        return """You are a professional editor helping to clean up transcribed speech. The text you receive is from speech-to-text software and may contain:
 
 - Filler words (um, uh, like, you know)
 - False starts and repetitions
@@ -90,193 +132,271 @@ class LLMProvider(ABC):
 - Missing punctuation
 - Informal speech patterns
 
-Your task is to improve the text while preserving the original meaning and intent."""
-        
-        if strategy == CleanupStrategy.CONSERVATIVE:
-            return base_prompt + """
+Your task is to improve the text while preserving the original meaning and intent. Follow these guidelines:
 
-CONSERVATIVE approach:
-- Make minimal changes
-- Only fix obvious transcription errors
-- Remove clear filler words (um, uh) but preserve conversational tone
-- Add basic punctuation
-- Preserve the speaker's voice and style"""
-        
-        elif strategy == CleanupStrategy.BALANCED:
-            return base_prompt + """
-
-BALANCED approach:
 - Remove filler words and false starts
 - Fix grammar and sentence structure
 - Improve clarity while maintaining natural tone
 - Add proper punctuation and capitalization
 - Break up run-on sentences
-- Keep the core message and style intact"""
-        
-        elif strategy == CleanupStrategy.AGGRESSIVE:
-            return base_prompt + """
+- Keep the core message and style intact
+- Preserve technical terms and proper nouns
+- Do not add new information or change the meaning
 
-AGGRESSIVE approach:
-- Extensively rewrite for maximum clarity and professionalism
-- Remove all conversational elements
-- Optimize sentence structure and flow
-- Use precise, professional language
-- Ensure perfect grammar and punctuation
-- Maintain factual accuracy but optimize presentation"""
-        
-        return base_prompt
+Return only the cleaned text without any additional commentary or formatting."""
 
 
-class OpenAIProvider(LLMProvider):
+class OpenAIProvider(CleanupProvider):
     """OpenAI GPT provider for text cleanup."""
     
     def __init__(
         self,
         model: str = "gpt-3.5-turbo",
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        timeout: float = 30.0
     ):
         super().__init__("openai")
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.timeout = timeout
         self._client: Optional[openai.OpenAI] = None
+    
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        return "OpenAI"
     
     def is_available(self) -> bool:
         """Check if OpenAI is available."""
         return OPENAI_AVAILABLE and bool(self.api_key)
     
-    def cleanup_text(
-        self,
-        text: str,
-        strategy: CleanupStrategy = CleanupStrategy.BALANCED,
-        timeout: float = 30.0
-    ) -> Optional[CleanupResult]:
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
         """Clean up text using OpenAI GPT."""
+        start_time = time.time()
+        
         if not self.is_available():
+            self.update_usage_stats(success=False)
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="openai",
+                processing_time=time.time() - start_time,
+                quality_score=0.0,
                 error="OpenAI not available (missing API key or package)"
             )
         
+        try:
+            # Run the synchronous OpenAI call in a thread pool
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                result = await loop.run_in_executor(
+                    executor, 
+                    self._sync_cleanup_text, 
+                    raw_text, 
+                    start_time
+                )
+            return result
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            self.update_usage_stats(success=False)
+            return CleanupResult(
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="openai",
+                processing_time=processing_time,
+                quality_score=0.0,
+                error=str(e)
+            )
+    
+    def _sync_cleanup_text(self, raw_text: str, start_time: float) -> CleanupResult:
+        """Synchronous cleanup method to be run in executor."""
         if not self._client:
-            self._client = openai.OpenAI(api_key=self.api_key, timeout=timeout)
-        
-        start_time = time.time()
+            self._client = openai.OpenAI(api_key=self.api_key, timeout=self.timeout)
         
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.get_cleanup_prompt(strategy)},
-                    {"role": "user", "content": f"Please clean up this transcribed text:\n\n{text}"}
+                    {"role": "system", "content": self.get_cleanup_prompt()},
+                    {"role": "user", "content": f"Please clean up this transcribed text:\n\n{raw_text}"}
                 ],
-                max_tokens=len(text.split()) * 2,  # Rough estimate
-                temperature=0.3  # Lower temperature for more consistent cleanup
+                max_tokens=min(4000, len(raw_text.split()) * 3),
+                temperature=0.3
             )
             
             processing_time = time.time() - start_time
             cleaned_text = response.choices[0].message.content.strip()
             
+            # Calculate quality score
+            quality_score = self.calculate_quality_score(raw_text, cleaned_text)
+            
+            # Track usage
+            tokens = response.usage.total_tokens if response.usage else 0
+            cost = self._estimate_cost(tokens)
+            self.update_usage_stats(success=True, cost=cost, tokens=tokens)
+            
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
+                original_text=raw_text,
                 cleaned_text=cleaned_text,
-                confidence=0.8,  # TODO: Calculate based on response quality
+                provider="openai",
                 processing_time=processing_time,
-                model_used=self.model,
-                tokens_used=response.usage.total_tokens if response.usage else None,
-                cost_estimate=self._estimate_cost(response.usage.total_tokens if response.usage else 0)
+                quality_score=quality_score,
+                metadata={
+                    "model": self.model,
+                    "tokens_used": tokens,
+                    "estimated_cost": cost
+                }
             )
             
         except Exception as e:
+            processing_time = time.time() - start_time
+            self.update_usage_stats(success=False)
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
-                processing_time=time.time() - start_time,
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="openai",
+                processing_time=processing_time,
+                quality_score=0.0,
                 error=str(e)
             )
     
     def _estimate_cost(self, tokens: int) -> float:
         """Estimate cost based on tokens used."""
-        # Rough estimates for GPT-3.5-turbo (as of 2024)
-        cost_per_1k_tokens = 0.002  # $0.002 per 1K tokens
+        # GPT-3.5-turbo pricing (approximate)
+        if "gpt-4" in self.model.lower():
+            cost_per_1k_tokens = 0.03  # GPT-4 is more expensive
+        else:
+            cost_per_1k_tokens = 0.002  # GPT-3.5-turbo
         return (tokens / 1000) * cost_per_1k_tokens
 
 
-class ClaudeProvider(LLMProvider):
+class ClaudeProvider(CleanupProvider):
     """Anthropic Claude provider for text cleanup."""
     
     def __init__(
         self,
         model: str = "claude-3-haiku-20240307",
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        timeout: float = 30.0
     ):
         super().__init__("claude")
         self.model = model
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.timeout = timeout
         self._client: Optional[Anthropic] = None
+    
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        return "Claude"
     
     def is_available(self) -> bool:
         """Check if Claude is available."""
         return ANTHROPIC_AVAILABLE and bool(self.api_key)
     
-    def cleanup_text(
-        self,
-        text: str,
-        strategy: CleanupStrategy = CleanupStrategy.BALANCED,
-        timeout: float = 30.0
-    ) -> Optional[CleanupResult]:
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
         """Clean up text using Claude."""
+        start_time = time.time()
+        
         if not self.is_available():
+            self.update_usage_stats(success=False)
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="claude",
+                processing_time=time.time() - start_time,
+                quality_score=0.0,
                 error="Claude not available (missing API key or package)"
             )
         
+        try:
+            # Run the synchronous Claude call in a thread pool
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                result = await loop.run_in_executor(
+                    executor, 
+                    self._sync_cleanup_text, 
+                    raw_text, 
+                    start_time
+                )
+            return result
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            self.update_usage_stats(success=False)
+            return CleanupResult(
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="claude",
+                processing_time=processing_time,
+                quality_score=0.0,
+                error=str(e)
+            )
+    
+    def _sync_cleanup_text(self, raw_text: str, start_time: float) -> CleanupResult:
+        """Synchronous cleanup method to be run in executor."""
         if not self._client:
-            self._client = Anthropic(api_key=self.api_key, timeout=timeout)
-        
-        start_time = time.time()
+            self._client = Anthropic(api_key=self.api_key, timeout=self.timeout)
         
         try:
             response = self._client.messages.create(
                 model=self.model,
-                max_tokens=len(text.split()) * 2,  # Rough estimate
-                system=self.get_cleanup_prompt(strategy),
+                max_tokens=min(4000, len(raw_text.split()) * 3),
+                system=self.get_cleanup_prompt(),
                 messages=[
-                    {"role": "user", "content": f"Please clean up this transcribed text:\n\n{text}"}
+                    {"role": "user", "content": f"Please clean up this transcribed text:\n\n{raw_text}"}
                 ]
             )
             
             processing_time = time.time() - start_time
             cleaned_text = response.content[0].text.strip()
             
+            # Calculate quality score
+            quality_score = self.calculate_quality_score(raw_text, cleaned_text)
+            
+            # Track usage
+            tokens = response.usage.input_tokens + response.usage.output_tokens if hasattr(response, 'usage') else 0
+            cost = self._estimate_cost(tokens)
+            self.update_usage_stats(success=True, cost=cost, tokens=tokens)
+            
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
+                original_text=raw_text,
                 cleaned_text=cleaned_text,
-                confidence=0.85,  # Claude generally produces high-quality output
+                provider="claude",
                 processing_time=processing_time,
-                model_used=self.model,
-                tokens_used=response.usage.input_tokens + response.usage.output_tokens if hasattr(response, 'usage') else None
+                quality_score=quality_score,
+                metadata={
+                    "model": self.model,
+                    "tokens_used": tokens,
+                    "estimated_cost": cost
+                }
             )
             
         except Exception as e:
+            processing_time = time.time() - start_time
+            self.update_usage_stats(success=False)
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
-                processing_time=time.time() - start_time,
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="claude",
+                processing_time=processing_time,
+                quality_score=0.0,
                 error=str(e)
             )
+    
+    def _estimate_cost(self, tokens: int) -> float:
+        """Estimate cost based on tokens used."""
+        # Claude pricing (approximate)
+        if "opus" in self.model.lower():
+            cost_per_1k_tokens = 0.015  # Claude Opus
+        elif "sonnet" in self.model.lower():
+            cost_per_1k_tokens = 0.003  # Claude Sonnet
+        else:
+            cost_per_1k_tokens = 0.00025  # Claude Haiku
+        return (tokens / 1000) * cost_per_1k_tokens
 
 
-class LocalLLMProvider(LLMProvider):
-    """Local LLM provider using lightweight models."""
+class LocalProvider(CleanupProvider):
+    """Local model provider placeholder for future implementation."""
     
     def __init__(self, model_path: Optional[str] = None):
         super().__init__("local")
@@ -284,104 +404,183 @@ class LocalLLMProvider(LLMProvider):
         self._model = None
         self._tokenizer = None
     
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        return "Local"
+    
     def is_available(self) -> bool:
         """Check if local LLM is available."""
         # TODO: Check for local model files, transformers library, etc.
-        return False  # Disabled for now
+        # For now, this is a placeholder and not available
+        return False
     
-    def cleanup_text(
-        self,
-        text: str,
-        strategy: CleanupStrategy = CleanupStrategy.BALANCED,
-        timeout: float = 30.0
-    ) -> Optional[CleanupResult]:
-        """Clean up text using local LLM."""
-        if not self.is_available():
-            return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
-                error="Local LLM not available"
-            )
-        
-        # TODO: Implement local LLM cleanup
-        # This would use something like transformers with a lightweight model
-        # optimized for text editing tasks
-        
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
+        """Clean up text using local LLM (placeholder)."""
         start_time = time.time()
         
-        # Placeholder: basic rule-based cleanup
-        cleaned_text = self._basic_cleanup(text)
-        
+        self.update_usage_stats(success=False)
         return CleanupResult(
-            provider_name=self.name,
-            original_text=text,
-            cleaned_text=cleaned_text,
-            confidence=0.5,  # Lower confidence for basic cleanup
+            original_text=raw_text,
+            cleaned_text=raw_text,
+            provider="local",
             processing_time=time.time() - start_time,
-            model_used="rule-based"
+            quality_score=0.0,
+            error="Local model provider not yet implemented"
         )
+
+
+class RuleBasedProvider(CleanupProvider):
+    """Simple rule-based cleanup provider as fallback."""
     
-    def _basic_cleanup(self, text: str) -> str:
-        """Basic rule-based text cleanup as a fallback."""
-        # Remove common filler words
-        fillers = ["um", "uh", "like", "you know", "so"]
-        words = text.split()
+    def __init__(self):
+        super().__init__("rule_based")
+        # Common filler words and patterns
+        self.filler_words = [
+            'um', 'uh', 'like', 'you know', 'so', 'well', 'actually',
+            'basically', 'literally', 'i mean', 'you see', 'right'
+        ]
+        self.false_starts = [
+            r'\b(and|but|so|well)\s+\1\b',  # Repeated conjunctions
+            r'\b(i|we|they|he|she)\s+\1\b',  # Repeated pronouns
+        ]
+    
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        return "Rule-Based"
+    
+    def is_available(self) -> bool:
+        """Rule-based provider is always available."""
+        return True
+    
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
+        """Clean up text using rule-based approach."""
+        start_time = time.time()
         
-        cleaned_words = []
-        for word in words:
-            # Remove filler words (case-insensitive)
-            if word.lower().strip(".,!?") not in fillers:
-                cleaned_words.append(word)
+        try:
+            cleaned_text = self._rule_based_cleanup(raw_text)
+            quality_score = self.calculate_quality_score(raw_text, cleaned_text)
+            
+            self.update_usage_stats(success=True)
+            
+            return CleanupResult(
+                original_text=raw_text,
+                cleaned_text=cleaned_text,
+                provider="rule_based",
+                processing_time=time.time() - start_time,
+                quality_score=quality_score,
+                metadata={"method": "rule-based"}
+            )
+            
+        except Exception as e:
+            self.update_usage_stats(success=False)
+            return CleanupResult(
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="rule_based",
+                processing_time=time.time() - start_time,
+                quality_score=0.0,
+                error=str(e)
+            )
+    
+    def _rule_based_cleanup(self, text: str) -> str:
+        """Perform rule-based text cleanup."""
+        if not text.strip():
+            return text
         
-        # Join and capitalize first letter
-        cleaned_text = " ".join(cleaned_words)
-        if cleaned_text:
-            cleaned_text = cleaned_text[0].upper() + cleaned_text[1:]
+        cleaned = text.lower().strip()
         
-        # Add period if missing
-        if cleaned_text and not cleaned_text.endswith((".", "!", "?")):
-            cleaned_text += "."
+        # Remove filler words
+        words = cleaned.split()
+        filtered_words = []
         
-        return cleaned_text
+        for i, word in enumerate(words):
+            # Clean punctuation for comparison
+            clean_word = word.strip('.,!?;:')
+            
+            # Skip filler words
+            if clean_word in self.filler_words:
+                continue
+                
+            # Skip if it's a repeated word (simple false start detection)
+            if i > 0 and clean_word == words[i-1].strip('.,!?;:'):
+                continue
+                
+            filtered_words.append(word)
+        
+        # Rejoin and fix capitalization
+        if not filtered_words:
+            return text
+            
+        cleaned = ' '.join(filtered_words)
+        
+        # Fix repeated patterns using regex
+        for pattern in self.false_starts:
+            cleaned = re.sub(pattern, r'\1', cleaned, flags=re.IGNORECASE)
+        
+        # Capitalize first letter
+        if cleaned:
+            cleaned = cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
+        
+        # Add period if missing and text doesn't end with punctuation
+        if cleaned and not re.search(r'[.!?]\s*$', cleaned):
+            cleaned += '.'
+        
+        # Clean up extra spaces
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        
+        return cleaned.strip()
 
 
-class MockProvider(LLMProvider):
+class MockProvider(CleanupProvider):
     """Mock provider for testing."""
     
-    def __init__(self, should_fail: bool = False):
+    def __init__(self, should_fail: bool = False, delay: float = 0.1):
         super().__init__("mock")
         self.should_fail = should_fail
+        self.delay = delay
+    
+    def get_provider_name(self) -> str:
+        """Get the name of this provider."""
+        return "Mock"
     
     def is_available(self) -> bool:
         """Mock is always available unless configured to fail."""
         return not self.should_fail
     
-    def cleanup_text(
-        self,
-        text: str,
-        strategy: CleanupStrategy = CleanupStrategy.BALANCED,
-        timeout: float = 30.0
-    ) -> Optional[CleanupResult]:
-        """Mock cleanup that just adds a prefix."""
+    async def cleanup_text(self, raw_text: str) -> CleanupResult:
+        """Mock cleanup that simulates processing."""
+        start_time = time.time()
+        
+        # Simulate processing time
+        if self.delay > 0:
+            await asyncio.sleep(self.delay)
+        
         if self.should_fail:
+            self.update_usage_stats(success=False)
             return CleanupResult(
-                provider_name=self.name,
-                original_text=text,
-                cleaned_text=text,
+                original_text=raw_text,
+                cleaned_text=raw_text,
+                provider="mock",
+                processing_time=time.time() - start_time,
+                quality_score=0.0,
                 error="Mock provider configured to fail"
             )
         
-        start_time = time.time()
+        # Simple mock cleanup - just clean up the text a bit
+        cleaned_text = raw_text.strip()
+        if cleaned_text and not cleaned_text.endswith(('.', '!', '?')):
+            cleaned_text += '.'
+        if cleaned_text:
+            cleaned_text = cleaned_text[0].upper() + cleaned_text[1:] if len(cleaned_text) > 1 else cleaned_text.upper()
         
-        # Simple mock cleanup
-        cleaned_text = f"[CLEANED] {text.strip()}"
+        quality_score = self.calculate_quality_score(raw_text, cleaned_text)
+        self.update_usage_stats(success=True)
         
         return CleanupResult(
-            provider_name=self.name,
-            original_text=text,
+            original_text=raw_text,
             cleaned_text=cleaned_text,
-            confidence=0.9,
+            provider="mock",
             processing_time=time.time() - start_time,
-            model_used="mock-v1"
+            quality_score=quality_score,
+            metadata={"mock_version": "1.0"}
         )
