@@ -58,7 +58,8 @@ class DictationApp:
         """Handle interrupt signals gracefully."""
         if self._recording:
             self.console.print("\n[yellow]⚠️  Recording interrupted, stopping...[/yellow]")
-            self.recorder.stop_recording()
+            # For async cleanup, we'll let the main exception handler deal with it
+            self._recording = False
         sys.exit(0)
     
     async def run_dictation_session(self) -> None:
@@ -116,26 +117,31 @@ class DictationApp:
             Path to recorded audio file, or None if recording failed.
         """
         try:
-            # Generate temporary file path
-            timestamp = int(time.time())
-            audio_path = self.temp_dir / f"recording_{timestamp}.wav"
-            self._recording_path = audio_path
-            
             # Start recording with UI feedback
             self.ui.show_recording_start()
-            self.recorder.start_recording(audio_path)
+            await self.recorder.start_recording()
             self._recording = True
             
             # Wait for user to press Enter to stop
-            input()  # Simple blocking input - user presses Enter to stop
+            # Use asyncio-friendly input handling
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, input)  # Run blocking input in thread
             
-            # Stop recording
-            self.recorder.stop_recording()
+            # Stop recording and get audio bytes
+            audio_data = await self.recorder.stop_recording()
             self._recording = False
             
             self.ui.show_recording_complete()
             
-            if audio_path.exists() and audio_path.stat().st_size > 0:
+            if audio_data and len(audio_data) > 100:  # Check for meaningful data
+                # Save audio data to temporary file
+                timestamp = int(time.time())
+                audio_path = self.temp_dir / f"recording_{timestamp}.wav"
+                self._recording_path = audio_path
+                
+                with open(audio_path, 'wb') as f:
+                    f.write(audio_data)
+                
                 return audio_path
             else:
                 self.console.print("[red]❌ No audio was recorded.[/red]")
@@ -143,6 +149,7 @@ class DictationApp:
                 
         except Exception as e:
             self.console.print(f"[red]❌ Recording failed: {e}[/red]")
+            self._recording = False
             return None
     
     async def _transcribe_audio(self, audio_path: Path) -> Optional[TranscriptionResult]:
