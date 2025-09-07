@@ -2,13 +2,26 @@
 Speech-to-text transcription using Faster Whisper.
 
 Provides optimized Whisper model integration for converting audio
-files to text with configurable model sizes and settings.
+files and bytes to text with configurable model sizes and settings.
+Supports real-time performance with large-v3-turbo model and VAD filtering.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 from dataclasses import dataclass
 import time
+import tempfile
+import os
+import asyncio
+import logging
+import platform
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
 
 try:
     from faster_whisper import WhisperModel
@@ -16,6 +29,8 @@ try:
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
     WhisperModel = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,39 +54,127 @@ class TranscriptionResult:
 
 class WhisperTranscriber:
     """
-    Faster Whisper-based speech-to-text transcriber.
+    Faster Whisper-based speech-to-text transcriber optimized for real-time performance.
     
-    Supports multiple model sizes and provides both full text and
-    segmented transcription with timing information.
+    Features:
+    - Large V3 Turbo model by default (5.4x faster than V2)
+    - Automatic device detection (CUDA, MPS for Mac, CPU fallback)
+    - VAD filtering for better speech detection
+    - Memory-efficient processing with proper compute types
+    - Support for both file paths and audio bytes
+    - Model caching and reuse for performance
     """
+    
+    # Available models in order of preference for fallback
+    AVAILABLE_MODELS = [
+        "large-v3-turbo",  # Latest, fastest large model
+        "large-v3",       # Previous large model
+        "medium",         # Good balance
+        "base",           # Fast, decent quality
+        "tiny"            # Fastest, lower quality
+    ]
     
     def __init__(
         self,
-        model_size: str = "base",
+        model_size: str = "large-v3-turbo",
         device: str = "auto",
-        compute_type: str = "auto"
+        compute_type: str = "auto",
+        vad_filter: bool = True,
+        vad_parameters: Optional[Dict[str, Any]] = None,
+        beam_size: int = 5,
+        language: Optional[str] = "en"  # Default to English for better performance
     ):
         """
-        Initialize the Whisper transcriber.
+        Initialize the Whisper transcriber with optimized settings.
         
         Args:
-            model_size: Whisper model size ('tiny', 'base', 'small', 'medium', 'large')
-            device: Device to run on ('cpu', 'cuda', or 'auto')
+            model_size: Whisper model size (default: 'large-v3-turbo' for best performance)
+            device: Device to run on ('cpu', 'cuda', 'mps', or 'auto')
             compute_type: Computation precision ('int8', 'float16', 'float32', or 'auto')
+            vad_filter: Enable Voice Activity Detection for better speech detection
+            vad_parameters: VAD configuration parameters
+            beam_size: Beam size for decoding (5 is good balance of speed/accuracy)
+            language: Default language for transcription ('en' for English, None for auto-detect)
         """
         self.model_size = model_size
-        self.device = device
-        self.compute_type = compute_type
+        self.device = self._detect_optimal_device() if device == "auto" else device
+        self.compute_type = self._detect_optimal_compute_type() if compute_type == "auto" else compute_type
+        self.vad_filter = vad_filter
+        self.vad_parameters = vad_parameters or {
+            "min_silence_duration_ms": 500,  # Better speech detection
+            "speech_pad_ms": 400
+        }
+        self.beam_size = beam_size
+        self.language = language
+        
         self._model: Optional[WhisperModel] = None
         self._model_loaded = False
+        self._model_info: Dict[str, Any] = {}
+    
+    def _detect_optimal_device(self) -> str:
+        """
+        Automatically detect the optimal device for the current system.
+        
+        Returns:
+            Optimal device string ('cuda', 'mps', or 'cpu')
+        """
+        try:
+            # Check for NVIDIA GPU
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except ImportError:
+            pass
+            
+        # Check for Apple Silicon Mac
+        if platform.system() == "Darwin":
+            try:
+                import torch
+                if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    return "mps"
+            except (ImportError, AttributeError):
+                pass
+                
+        return "cpu"
+    
+    def _detect_optimal_compute_type(self) -> str:
+        """
+        Detect optimal compute type based on device and system memory.
+        
+        Returns:
+            Optimal compute type string
+        """
+        if self.device == "cuda":
+            # Use float16 for GPU to save memory and increase speed
+            return "float16"
+        elif self.device == "mps":
+            # Apple Silicon supports float16
+            return "float16"
+        else:
+            # CPU - use int8 for better performance and lower memory usage
+            if PSUTIL_AVAILABLE:
+                try:
+                    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+                    if available_memory_gb < 4:
+                        return "int8"
+                    else:
+                        return "float32"
+                except Exception:
+                    # Fallback if psutil fails
+                    return "int8"
+            else:
+                # Conservative default without psutil
+                return "int8"
     
     def load_model(self) -> None:
         """
-        Load the Whisper model.
+        Load the Whisper model with fallback support.
+        
+        Attempts to load the requested model, falling back to smaller models
+        if memory or compatibility issues occur.
         
         Raises:
-            RuntimeError: If Faster Whisper is not available.
-            Exception: If model loading fails.
+            RuntimeError: If Faster Whisper is not available or all models fail to load.
         """
         if not FASTER_WHISPER_AVAILABLE:
             raise RuntimeError(
@@ -81,29 +184,69 @@ class WhisperTranscriber:
         if self._model_loaded:
             return
         
-        try:
-            self._model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type
-            )
-            self._model_loaded = True
-        except Exception as e:
-            raise Exception(f"Failed to load Whisper model '{self.model_size}': {e}")
+        # Try requested model first, then fallback to smaller models
+        models_to_try = [self.model_size]
+        for model in self.AVAILABLE_MODELS:
+            if model != self.model_size and model not in models_to_try:
+                models_to_try.append(model)
+        
+        last_error = None
+        for model_size in models_to_try:
+            try:
+                logger.info(f"Loading Whisper model: {model_size} on {self.device} with {self.compute_type}")
+                
+                # Load model with optimized settings
+                self._model = WhisperModel(
+                    model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    download_root=None,  # Use default cache directory
+                    local_files_only=False  # Allow downloading if needed
+                )
+                
+                # Update actual model size used (in case of fallback)
+                self.model_size = model_size
+                self._model_loaded = True
+                
+                # Store model information
+                self._model_info = {
+                    'model_size': model_size,
+                    'device': self.device,
+                    'compute_type': self.compute_type,
+                    'vad_filter': self.vad_filter,
+                    'beam_size': self.beam_size,
+                    'language': self.language
+                }
+                
+                logger.info(f"Successfully loaded Whisper model: {model_size}")
+                return
+                
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to load model '{model_size}': {e}")
+                if model_size == models_to_try[-1]:
+                    # This was the last model to try
+                    break
+                continue
+        
+        # All models failed to load
+        raise RuntimeError(
+            f"Failed to load any Whisper model. Last error: {last_error}"
+        )
     
-    def transcribe(
+    async def transcribe(
         self,
-        audio_path: Path,
+        audio_data: bytes,
         language: Optional[str] = None,
         initial_prompt: Optional[str] = None,
         word_timestamps: bool = False
     ) -> TranscriptionResult:
         """
-        Transcribe an audio file to text.
+        Transcribe audio bytes to text.
         
         Args:
-            audio_path: Path to the audio file to transcribe
-            language: Language code to use (None for auto-detection)
+            audio_data: WAV audio data as bytes
+            language: Language code to use (uses instance default if None)
             initial_prompt: Initial prompt to guide transcription
             word_timestamps: Whether to include word-level timestamps
             
@@ -111,24 +254,46 @@ class WhisperTranscriber:
             TranscriptionResult with the transcribed text and metadata.
             
         Raises:
-            FileNotFoundError: If audio file doesn't exist.
             RuntimeError: If model not loaded or transcription fails.
+            ValueError: If audio_data is empty or invalid.
         """
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        if not audio_data:
+            raise ValueError("Audio data cannot be empty")
         
         if not self._model_loaded:
             self.load_model()
         
+        # Use instance language as default
+        effective_language = language or self.language
+        
         start_time = time.time()
+        temp_file = None
         
         try:
-            # Transcribe using faster-whisper
-            segments, info = self._model.transcribe(
-                str(audio_path),
-                language=language,
-                initial_prompt=initial_prompt,
-                word_timestamps=word_timestamps
+            # Create temporary file for audio data
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_file_path = temp_file.name
+            
+            # Configure transcription parameters
+            transcribe_params = {
+                "audio": temp_file_path,
+                "language": effective_language,
+                "initial_prompt": initial_prompt,
+                "word_timestamps": word_timestamps,
+                "beam_size": self.beam_size,
+                "vad_filter": self.vad_filter
+            }
+            
+            # Add VAD parameters if VAD is enabled
+            if self.vad_filter and self.vad_parameters:
+                transcribe_params["vad_parameters"] = self.vad_parameters
+            
+            # Run transcription in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            segments, info = await loop.run_in_executor(
+                None, 
+                lambda: self._model.transcribe(**transcribe_params)
             )
             
             # Convert segments to our format
@@ -149,41 +314,89 @@ class WhisperTranscriber:
             processing_time = time.time() - start_time
             full_text = " ".join(full_text_parts)
             
+            # Log performance metrics
+            audio_duration = getattr(info, 'duration', 0)
+            if audio_duration > 0:
+                rtf = processing_time / audio_duration  # Real-time factor
+                logger.info(f"Transcription completed: {processing_time:.2f}s for {audio_duration:.2f}s audio (RTF: {rtf:.2f})")
+            
             return TranscriptionResult(
                 text=full_text,
                 segments=transcription_segments,
-                language=info.language if hasattr(info, 'language') else None,
-                duration=info.duration if hasattr(info, 'duration') else None,
+                language=getattr(info, 'language', effective_language),
+                duration=audio_duration,
                 processing_time=processing_time
             )
             
         except Exception as e:
+            logger.error(f"Transcription failed: {e}")
             raise RuntimeError(f"Transcription failed: {e}")
+        finally:
+            # Clean up temporary file
+            if temp_file and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp file: {e}")
     
-    def transcribe_streaming(
+    async def transcribe_file(
         self,
-        audio_path: Path,
-        chunk_callback: Optional[callable] = None
+        file_path: Union[str, Path],
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        word_timestamps: bool = False
     ) -> TranscriptionResult:
         """
-        Transcribe audio with streaming/progressive results.
+        Transcribe an audio file to text.
         
         Args:
-            audio_path: Path to the audio file
-            chunk_callback: Optional callback for receiving segments as they're processed
+            file_path: Path to the audio file to transcribe
+            language: Language code to use (uses instance default if None)
+            initial_prompt: Initial prompt to guide transcription
+            word_timestamps: Whether to include word-level timestamps
             
         Returns:
-            Complete TranscriptionResult
+            TranscriptionResult with the transcribed text and metadata.
+            
+        Raises:
+            FileNotFoundError: If audio file doesn't exist.
+            RuntimeError: If model not loaded or transcription fails.
         """
-        # For now, this is the same as regular transcription
-        # In the future, this could provide real-time streaming
-        result = self.transcribe(audio_path)
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
         
-        if chunk_callback:
-            for segment in result.segments:
-                chunk_callback(segment)
+        # Read file and transcribe
+        with open(file_path, 'rb') as f:
+            audio_data = f.read()
+            
+        return await self.transcribe(
+            audio_data=audio_data,
+            language=language,
+            initial_prompt=initial_prompt,
+            word_timestamps=word_timestamps
+        )
+    
+    def get_available_models(self) -> List[str]:
+        """
+        Get list of available Whisper model sizes.
         
-        return result
+        Returns:
+            List of model size strings in order of preference.
+        """
+        return self.AVAILABLE_MODELS.copy()
+    
+    def is_model_available(self, model_size: str) -> bool:
+        """
+        Check if a specific model is available/supported.
+        
+        Args:
+            model_size: Model size to check
+            
+        Returns:
+            True if model is supported, False otherwise
+        """
+        return model_size in self.AVAILABLE_MODELS
     
     def is_model_loaded(self) -> bool:
         """Check if the model is currently loaded."""
@@ -191,18 +404,62 @@ class WhisperTranscriber:
     
     def get_model_info(self) -> Dict[str, Any]:
         """
-        Get information about the current model.
+        Get comprehensive information about the current model.
         
         Returns:
             Dictionary with model information.
         """
-        return {
+        info = {
             'model_size': self.model_size,
             'device': self.device,
             'compute_type': self.compute_type,
+            'vad_filter': self.vad_filter,
+            'beam_size': self.beam_size,
+            'language': self.language,
             'loaded': self._model_loaded,
-            'available': FASTER_WHISPER_AVAILABLE
+            'available': FASTER_WHISPER_AVAILABLE,
+            'available_models': self.AVAILABLE_MODELS
         }
+        
+        # Add loaded model specific information
+        if self._model_loaded and self._model_info:
+            info.update(self._model_info)
+            
+        return info
+    
+    async def warm_up(self) -> None:
+        """
+        Warm up the model by loading it and running a small test transcription.
+        
+        This helps reduce latency for the first real transcription.
+        """
+        if not self._model_loaded:
+            self.load_model()
+        
+        # Create a small silent audio clip for warm-up
+        import wave
+        import io
+        
+        # Create 1 second of silence at 16kHz
+        sample_rate = 16000
+        duration = 1.0
+        silence = b'\x00' * int(sample_rate * duration * 2)  # 16-bit = 2 bytes per sample
+        
+        # Create WAV data
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(silence)
+        
+        # Run warm-up transcription
+        try:
+            wav_data = wav_buffer.getvalue()
+            await self.transcribe(wav_data)
+            logger.info("Model warm-up completed")
+        except Exception as e:
+            logger.warning(f"Model warm-up failed: {e}")
 
 
 def get_available_models() -> List[str]:
@@ -210,9 +467,9 @@ def get_available_models() -> List[str]:
     Get list of available Whisper model sizes.
     
     Returns:
-        List of model size strings.
+        List of model size strings in order of preference.
     """
-    return ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"]
+    return WhisperTranscriber.AVAILABLE_MODELS.copy()
 
 
 def estimate_model_memory(model_size: str) -> str:
@@ -232,14 +489,15 @@ def estimate_model_memory(model_size: str) -> str:
         "medium": "~769 MB",
         "large-v1": "~1550 MB",
         "large-v2": "~1550 MB",
-        "large-v3": "~1550 MB"
+        "large-v3": "~1550 MB",
+        "large-v3-turbo": "~1550 MB"
     }
     
     return memory_estimates.get(model_size, "Unknown")
 
 
-def benchmark_model(
-    model_size: str = "base",
+async def benchmark_model(
+    model_size: str = "large-v3-turbo",
     test_duration: float = 10.0
 ) -> Dict[str, float]:
     """
@@ -252,12 +510,83 @@ def benchmark_model(
     Returns:
         Dictionary with performance metrics.
     """
-    # TODO: Implement model benchmarking
-    # This would create a test audio file and measure transcription speed
-    return {
-        'model_size': model_size,
-        'audio_duration': test_duration,
-        'processing_time': 0.0,
-        'real_time_factor': 0.0,
-        'memory_usage': 0.0
-    }
+    try:
+        import wave
+        import io
+        
+        # Check for optional dependencies
+        if not PSUTIL_AVAILABLE:
+            raise ImportError("psutil not available")
+        
+        try:
+            import numpy as np
+        except ImportError:
+            raise ImportError("numpy not available")
+        
+        # Create test audio with some noise (more realistic than silence)
+        sample_rate = 16000
+        samples = int(sample_rate * test_duration)
+        
+        # Generate white noise at low volume to simulate speech-like audio
+        np.random.seed(42)  # Reproducible results
+        audio_samples = (np.random.random(samples) * 0.1 * 32767).astype(np.int16)
+        
+        # Create WAV data
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_samples.tobytes())
+        
+        wav_data = wav_buffer.getvalue()
+        
+        # Initialize transcriber
+        transcriber = WhisperTranscriber(model_size=model_size)
+        
+        # Measure memory before
+        process = psutil.Process()
+        memory_before = process.memory_info().rss / 1024 / 1024  # MB
+        
+        # Benchmark transcription
+        start_time = time.time()
+        result = await transcriber.transcribe(wav_data)
+        end_time = time.time()
+        
+        # Measure memory after
+        memory_after = process.memory_info().rss / 1024 / 1024  # MB
+        memory_used = memory_after - memory_before
+        
+        processing_time = end_time - start_time
+        real_time_factor = processing_time / test_duration if test_duration > 0 else 0
+        
+        return {
+            'model_size': model_size,
+            'audio_duration': test_duration,
+            'processing_time': processing_time,
+            'real_time_factor': real_time_factor,
+            'memory_usage_mb': memory_used,
+            'transcribed_text_length': len(result.text) if result.text else 0,
+            'segments_count': len(result.segments) if result.segments else 0
+        }
+        
+    except ImportError as e:
+        logger.warning(f"Benchmark requires additional packages: {e}")
+        return {
+            'model_size': model_size,
+            'audio_duration': test_duration,
+            'processing_time': 0.0,
+            'real_time_factor': 0.0,
+            'memory_usage_mb': 0.0,
+            'error': f"Missing dependencies: {e}"
+        }
+    except Exception as e:
+        logger.error(f"Benchmark failed: {e}")
+        return {
+            'model_size': model_size,
+            'audio_duration': test_duration,
+            'processing_time': 0.0,
+            'real_time_factor': 0.0,
+            'memory_usage_mb': 0.0,
+            'error': str(e)
+        }

@@ -9,6 +9,22 @@ Before embarking on any task, perform a quick pre-flight check:
 
 **If any ambiguities, missing details, or concerns are identified, STOP and ask for clarification before proceeding.**
 
+**Note: This applies to the main orchestrating agent only. Sub-agents must follow different guidelines (see below).**
+
+## Sub-Agent vs Main Agent Behavior
+
+### Main Agent (Orchestrator)
+- **ALWAYS** perform pre-flight checks and ask clarifying questions
+- Wait for user responses before proceeding with ambiguous tasks
+- Coordinate between sub-agents and user requirements
+
+### Sub-Agents (Task Executors)
+- **CANNOT** ask questions - they only return a single message
+- **MUST** make reasonable assumptions and document them
+- **MUST** complete their assigned task even with uncertainty
+- Refer to SUBAGENT_GUIDELINES.md for default assumptions
+- Document assumptions in code comments or task output
+
 ## Commit Discipline
 
 Upon completion of any task:

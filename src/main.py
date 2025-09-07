@@ -164,9 +164,12 @@ class DictationApp:
         """
         try:
             with self.ui.show_transcription_progress():
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, self.transcriber.transcribe_file, audio_path
-                )
+                # Read audio data from file
+                with open(audio_path, 'rb') as f:
+                    audio_data = f.read()
+                
+                # Use the new async transcribe method
+                result = await self.transcriber.transcribe(audio_data)
                 
             if result and result.text.strip():
                 return result

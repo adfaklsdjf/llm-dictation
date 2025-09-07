@@ -1,0 +1,23 @@
+# Core ML and Audio Dependencies
+faster-whisper>=1.0.0  # Optimized Whisper for speech-to-text
+pyaudio>=0.2.11        # Cross-platform audio I/O
+psutil>=5.8.0          # System and process monitoring
+torch>=2.0.0           # PyTorch for device detection (GPU/MPS support)
+numpy>=1.20.0          # Numerical computing for benchmarking
+
+# UI and Terminal
+rich>=13.0.0           # Beautiful terminal interfaces
+click>=8.0.0           # Command-line interface creation
+
+# LLM and Text Processing
+openai>=1.0.0          # OpenAI API for text cleanup
+requests>=2.28.0       # HTTP requests for API calls
+
+# System Integration
+keyboard>=0.13.5       # Global hotkey detection
+pyperclip>=1.8.2       # Clipboard operations
+pydantic>=2.0.0        # Data validation and settings
+
+# Development and Configuration
+python-dotenv>=1.0.0   # Environment variable management
+pyyaml>=6.0            # Configuration file support
