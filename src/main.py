@@ -21,7 +21,7 @@ import pyperclip
 from . import __version__
 from .audio.recorder import AudioRecorder
 from .audio.transcriber import WhisperTranscriber, TranscriptionResult
-from .cleanup.cleaner import TextCleaner, CleanupStrategy
+from .cleanup.cleaner import TextCleaner
 from .cleanup.providers import OpenAIProvider, ClaudeProvider
 from .ui.terminal import TerminalUI
 
@@ -45,6 +45,7 @@ class DictationApp:
         # Configuration
         self.temp_dir = Path(tempfile.gettempdir()) / "llm-dictation"
         self.temp_dir.mkdir(exist_ok=True)
+        self.cleanup_strategy = "parallel"  # Default strategy
         
         # State
         self._recording = False
@@ -192,14 +193,14 @@ class DictationApp:
             Multi-cleanup result, or None if cleanup failed.
         """
         try:
-            with self.ui.show_cleanup_progress():
-                result = await self.cleaner.cleanup_text_multi(
-                    text,
-                    strategy=CleanupStrategy.BALANCED
-                )
-                
-            if result and result.results:
-                return result
+            self.console.print("✨ [cyan]Cleaning up text with multiple providers...[/cyan]")
+            results = await self.cleaner.cleanup_text(
+                text,
+                strategy=self.cleanup_strategy
+            )
+            
+            if results:
+                return results
             else:
                 self.console.print("[red]❌ Text cleanup failed.[/red]")
                 return None
@@ -241,9 +242,9 @@ class DictationApp:
 )
 @click.option(
     '--strategy',
-    default='balanced',
+    default='parallel',
     help='Text cleanup strategy',
-    type=click.Choice(['conservative', 'balanced', 'aggressive'])
+    type=click.Choice(['parallel', 'cascade', 'single'])
 )
 def main(model_size: str, strategy: str) -> None:
     """
@@ -259,8 +260,11 @@ def main(model_size: str, strategy: str) -> None:
         # Configure transcriber model
         app.transcriber.model_size = model_size
         
-        # Configure cleanup strategy
-        cleanup_strategy = CleanupStrategy(strategy)
+        # Configure cleanup strategy (validate)
+        if strategy not in ["parallel", "cascade", "single"]:
+            click.echo(f"Invalid strategy '{strategy}', using 'parallel'")
+            strategy = "parallel"
+        app.cleanup_strategy = strategy
         
         # Run the application
         asyncio.run(app.run_dictation_session())
