@@ -81,7 +81,7 @@ class DictationApp:
                 return
             
             # Show raw transcription
-            self.ui.show_transcription(transcription)
+            await self.ui.show_transcription_progress(f"Raw transcription: {transcription.text}")
             
             # Clean up text with multiple providers
             cleanup_result = await self._cleanup_text(transcription.text)
@@ -89,7 +89,10 @@ class DictationApp:
                 return
             
             # Show cleanup results and let user choose
-            selected_result = self.ui.show_cleanup_results(cleanup_result)
+            selection_idx = await self.ui.display_cleanup_results(cleanup_result)
+            if selection_idx < 0 or selection_idx >= len(cleanup_result):
+                return
+            selected_result = cleanup_result[selection_idx]
             if not selected_result:
                 return
             
@@ -97,7 +100,7 @@ class DictationApp:
             self._copy_to_clipboard(selected_result.cleaned_text)
             
             # Show completion message
-            self.ui.show_completion(selected_result.cleaned_text)
+            await self.ui.show_success("✅ Text copied to clipboard!")
             
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Session cancelled by user.[/yellow]")
@@ -116,7 +119,8 @@ class DictationApp:
         """
         try:
             # Start recording with UI feedback
-            self.ui.show_recording_start()
+            if not await self.ui.prompt_start_recording():
+                return None
             await self.recorder.start_recording()
             self._recording = True
             
@@ -129,7 +133,7 @@ class DictationApp:
             audio_data = await self.recorder.stop_recording()
             self._recording = False
             
-            self.ui.show_recording_complete()
+            await self.ui.show_success("🎙️ Recording complete!")
             
             if audio_data and len(audio_data) > 100:  # Check for meaningful data
                 # Save audio data to temporary file
@@ -161,13 +165,15 @@ class DictationApp:
             Transcription result, or None if transcription failed.
         """
         try:
-            with self.ui.show_transcription_progress():
-                # Read audio data from file
-                with open(audio_path, 'rb') as f:
-                    audio_data = f.read()
-                
-                # Use the new async transcribe method
-                result = await self.transcriber.transcribe(audio_data)
+            # Show transcription progress
+            await self.ui.show_transcription_progress("🤖 Transcribing audio with Whisper...")
+            
+            # Read audio data from file
+            with open(audio_path, 'rb') as f:
+                audio_data = f.read()
+            
+            # Use the new async transcribe method
+            result = await self.transcriber.transcribe(audio_data)
                 
             if result and result.text.strip():
                 return result
