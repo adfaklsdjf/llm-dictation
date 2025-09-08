@@ -70,10 +70,7 @@ class DictationApp:
         Handles the full workflow from recording to clipboard copy.
         """
         try:
-            # Show welcome and instructions
-            self.ui.show_welcome()
-            
-            # Record audio
+            # Record audio (welcome message shown in prompt_start_recording)
             audio_path = await self._record_audio()
             if not audio_path:
                 return
