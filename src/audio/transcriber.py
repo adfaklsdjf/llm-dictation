@@ -115,8 +115,11 @@ class WhisperTranscriber:
         """
         Automatically detect the optimal device for the current system.
         
+        Note: MPS (Apple Silicon GPU) is not properly supported by faster-whisper,
+        so we use CPU for macOS systems even with Apple Silicon.
+        
         Returns:
-            Optimal device string ('cuda', 'mps', or 'cpu')
+            Optimal device string ('cuda' or 'cpu')
         """
         try:
             # Check for NVIDIA GPU
@@ -126,14 +129,11 @@ class WhisperTranscriber:
         except ImportError:
             pass
             
-        # Check for Apple Silicon Mac
+        # For macOS (including Apple Silicon), use CPU
+        # faster-whisper doesn't properly support MPS despite PyTorch availability
         if platform.system() == "Darwin":
-            try:
-                import torch
-                if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    return "mps"
-            except (ImportError, AttributeError):
-                pass
+            logger.info("Running on macOS: using CPU device (MPS not supported by faster-whisper)")
+            return "cpu"
                 
         return "cpu"
     
@@ -147,9 +147,7 @@ class WhisperTranscriber:
         if self.device == "cuda":
             # Use float16 for GPU to save memory and increase speed
             return "float16"
-        elif self.device == "mps":
-            # Apple Silicon supports float16
-            return "float16"
+# MPS removed - not supported by faster-whisper
         else:
             # CPU - use int8 for better performance and lower memory usage
             if PSUTIL_AVAILABLE:
@@ -191,43 +189,59 @@ class WhisperTranscriber:
                 models_to_try.append(model)
         
         last_error = None
+        devices_to_try = [self.device]
+        if self.device != "cpu":
+            devices_to_try.append("cpu")  # Always try CPU as ultimate fallback
+        
         for model_size in models_to_try:
-            try:
-                logger.info(f"Loading Whisper model: {model_size} on {self.device} with {self.compute_type}")
+            for device in devices_to_try:
+                try:
+                    # Adjust compute type based on device
+                    compute_type = self.compute_type
+                    if device == "cpu" and self.compute_type == "float16":
+                        compute_type = "int8"  # CPU doesn't support float16 well
+                    
+                    logger.info(f"Loading Whisper model: {model_size} on {device} with {compute_type}")
+                    
+                    # Load model with optimized settings
+                    self._model = WhisperModel(
+                        model_size,
+                        device=device,
+                        compute_type=compute_type,
+                        download_root=None,  # Use default cache directory
+                        local_files_only=False  # Allow downloading if needed
+                    )
+                    
+                    # Update device settings if we had to fall back
+                    if device != self.device:
+                        logger.info(f"Fell back to device: {device}")
+                        self.device = device
+                        self.compute_type = compute_type
                 
-                # Load model with optimized settings
-                self._model = WhisperModel(
-                    model_size,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                    download_root=None,  # Use default cache directory
-                    local_files_only=False  # Allow downloading if needed
-                )
-                
-                # Update actual model size used (in case of fallback)
-                self.model_size = model_size
-                self._model_loaded = True
-                
-                # Store model information
-                self._model_info = {
-                    'model_size': model_size,
-                    'device': self.device,
-                    'compute_type': self.compute_type,
-                    'vad_filter': self.vad_filter,
-                    'beam_size': self.beam_size,
-                    'language': self.language
-                }
-                
-                logger.info(f"Successfully loaded Whisper model: {model_size}")
-                return
-                
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Failed to load model '{model_size}': {e}")
-                if model_size == models_to_try[-1]:
-                    # This was the last model to try
-                    break
-                continue
+                    # Update actual model size used (in case of fallback)
+                    self.model_size = model_size
+                    self._model_loaded = True
+                    
+                    # Store model information
+                    self._model_info = {
+                        'model_size': model_size,
+                        'device': self.device,
+                        'compute_type': self.compute_type,
+                        'vad_filter': self.vad_filter,
+                        'beam_size': self.beam_size,
+                        'language': self.language
+                    }
+                    
+                    logger.info(f"Successfully loaded Whisper model: {model_size} on {device}")
+                    return
+                    
+                except Exception as e:
+                    last_error = e
+                    error_msg = f"Failed to load model '{model_size}' on device '{device}': {e}"
+                    logger.warning(error_msg)
+                    # Continue to try next device for this model
+                    continue
+            # If all devices failed for this model, continue to next model
         
         # All models failed to load
         raise RuntimeError(
