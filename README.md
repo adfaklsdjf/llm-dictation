@@ -20,10 +20,6 @@ This makes the resulting prompts less effective and harder to read.
 3. **Cleans up** the raw transcription using LLMs to remove stammering and improve clarity
 4. **Delivers** clean, coherent text ready to use as LLM prompts
 
-## ✅ MVP Status: Complete!
-
-The terminal-based proof-of-concept is fully implemented and ready for testing.
-
 ### Implemented Features
 - 🎤 **Audio Recording**: Cross-platform recording with PyAudio
 - 🗣️ **Speech-to-Text**: Optimized Whisper (large-v3-turbo) transcription
@@ -48,11 +44,11 @@ The terminal-based proof-of-concept is fully implemented and ready for testing.
    ```bash
    git clone <repository-url>
    cd llm-dictation
-   
+
    # Create virtual environment
    python3 -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
-   
+
    # Install dependencies
    pip install -r requirements.txt
    ```
@@ -62,10 +58,10 @@ The terminal-based proof-of-concept is fully implemented and ready for testing.
    # macOS
    brew install portaudio
    pip install pyaudio
-   
+
    # Ubuntu/Debian
    sudo apt-get install python3-pyaudio
-   
+
    # Windows
    pip install pyaudio
    ```
