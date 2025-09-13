@@ -32,6 +32,7 @@ This makes the resulting prompts less effective and harder to read.
 
 ### Prerequisites
 - **Python 3.9+** (3.11+ recommended)
+- **uv package manager** ([install here](https://docs.astral.sh/uv/getting-started/installation/))
 - **Microphone access** (system permissions required)
 - **4GB+ RAM** (for Whisper models)
 - **API Keys** (optional, for best cleanup quality):
@@ -45,26 +46,20 @@ This makes the resulting prompts less effective and harder to read.
    git clone <repository-url>
    cd llm-dictation
 
-   # Create virtual environment
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-   # Install dependencies
-   pip install -r requirements.txt
+   # Install dependencies (uv handles virtual environment automatically)
+   uv sync
    ```
 
-2. **Install PyAudio** (platform-specific):
+2. **Install system dependencies** (platform-specific):
    ```bash
-   # macOS
+   # macOS (if you get PyAudio errors)
    brew install portaudio
-   pip install pyaudio
 
-   # Ubuntu/Debian
-   sudo apt-get install python3-pyaudio
-
-   # Windows
-   pip install pyaudio
+   # Ubuntu/Debian (if you get PyAudio errors)
+   sudo apt-get install python3-dev portaudio19-dev
    ```
+   
+   Note: `uv` should handle PyAudio installation automatically, but you may need these system libraries.
 
 3. **Set up API keys** (optional but recommended):
    ```bash
@@ -77,14 +72,14 @@ This makes the resulting prompts less effective and harder to read.
 #### Basic Usage
 ```bash
 # Run the application
-python3 -m src.main
+uv run python -m src.main
 
 # Or with specific options
-python3 -m src.main --model-size base --strategy parallel
+uv run python -m src.main --model-size base --strategy parallel
 ```
 
 #### Command Line Options
-- `--model-size`: Whisper model (`tiny`, `base`, `medium`, `large-v3-turbo`)
+- `--model-size`: Whisper model (`tiny`, `base`, `small`, `medium`, `large`)
 - `--strategy`: Cleanup strategy (`parallel`, `cascade`, `single`)
 
 #### Workflow
@@ -96,7 +91,8 @@ python3 -m src.main --model-size base --strategy parallel
 6. **Use**: Text is copied to clipboard automatically
 
 ### Example Session
-```
+```bash
+$ uv run python -m src.main
 🎤 LLM Dictation - Ready to transcribe your thoughts!
 
 Press Enter to start recording...
