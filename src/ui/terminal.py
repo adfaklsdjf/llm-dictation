@@ -204,20 +204,20 @@ class TerminalUI:
                 # Show error results in red
                 table.add_row(
                     str(i + 1),
-                    result.provider_name,
+                    result.provider,
                     f"[red]Error: {result.error}[/red]",
                     "N/A",
                     f"{result.processing_time:.1f}s"
                 )
             else:
                 valid_results.append((i, result))
-                confidence_str = f"{result.confidence:.0%}" if result.confidence else "N/A"
+                quality_str = f"{result.quality_score:.1f}" if result.quality_score else "N/A"
                 
                 table.add_row(
                     str(i + 1),
-                    result.provider_name,
+                    result.provider,
                     result.cleaned_text,
-                    confidence_str,
+                    quality_str,
                     f"{result.processing_time:.1f}s"
                 )
         
@@ -227,16 +227,16 @@ class TerminalUI:
             await self.show_error(Exception("No valid cleanup results"))
             return -1
         
-        # Highlight best result (highest confidence)
+        # Highlight best result (highest quality score)
         best_result_idx = -1
-        best_confidence = 0.0
+        best_quality = 0.0
         for idx, result in valid_results:
-            if result.confidence and result.confidence > best_confidence:
-                best_confidence = result.confidence
+            if result.quality_score and result.quality_score > best_quality:
+                best_quality = result.quality_score
                 best_result_idx = idx
         
         if best_result_idx >= 0:
-            self.console.print(f"\n⭐ Recommended: Option {best_result_idx + 1} ({results[best_result_idx].provider_name})")
+            self.console.print(f"\n⭐ Recommended: Option {best_result_idx + 1} ({results[best_result_idx].provider})")
         
         self.console.print()
         
@@ -374,20 +374,20 @@ async def demo_ui() -> None:
         
         mock_results = [
             CleanupResult(
-                provider_name="openai",
+                provider="openai",
                 original_text="Um, so like, this is a test, you know?",
                 cleaned_text="This is a test.",
-                confidence=0.9,
+                quality_score=9.0,
                 processing_time=1.2,
-                model_used="gpt-3.5-turbo"
+                metadata={"model_used": "gpt-3.5-turbo"}
             ),
             CleanupResult(
-                provider_name="claude",
+                provider="claude",
                 original_text="Um, so like, this is a test, you know?",
                 cleaned_text="This is a test example.",
-                confidence=0.85,
+                quality_score=8.5,
                 processing_time=1.5,
-                model_used="claude-3-haiku"
+                metadata={"model_used": "claude-3-haiku"}
             )
         ]
         
