@@ -12,6 +12,7 @@ from typing import Optional, List
 import tempfile
 import signal
 import time
+import logging
 from contextlib import asynccontextmanager
 
 import click
@@ -24,6 +25,8 @@ from .audio.transcriber import WhisperTranscriber, TranscriptionResult
 from .cleanup.cleaner import TextCleaner
 from .cleanup.providers import OpenAIProvider, ClaudeProvider
 from .ui.terminal import TerminalUI
+
+logger = logging.getLogger(__name__)
 
 
 class DictationApp:
@@ -42,9 +45,16 @@ class DictationApp:
         self.cleaner = TextCleaner()
         self.console = Console()
         
-        # Configuration
+        # Configuration - create temp directory with error handling
         self.temp_dir = Path(tempfile.gettempdir()) / "llm-dictation"
-        self.temp_dir.mkdir(exist_ok=True)
+        try:
+            self.temp_dir.mkdir(exist_ok=True)
+        except PermissionError:
+            logger.warning(f"Permission denied creating temp directory {self.temp_dir}, using system temp")
+            self.temp_dir = Path(tempfile.gettempdir())
+        except OSError as e:
+            logger.warning(f"Error creating temp directory {self.temp_dir}: {e}, using system temp")
+            self.temp_dir = Path(tempfile.gettempdir())
         self.cleanup_strategy = "parallel"  # Default strategy
         
         # State
@@ -141,10 +151,19 @@ class DictationApp:
                 audio_path = self.temp_dir / f"recording_{timestamp}.wav"
                 self._recording_path = audio_path
                 
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_data)
-                
-                return audio_path
+                try:
+                    with open(audio_path, 'wb') as f:
+                        f.write(audio_data)
+                    return audio_path
+                except OSError as e:
+                    if e.errno == 28:  # No space left on device
+                        self.console.print("[red]❌ Insufficient disk space to save recording.[/red]")
+                    else:
+                        self.console.print(f"[red]❌ Failed to save recording: {e}[/red]")
+                    return None
+                except Exception as e:
+                    self.console.print(f"[red]❌ Unexpected error saving recording: {e}[/red]")
+                    return None
             else:
                 self.console.print("[red]❌ No audio was recorded.[/red]")
                 return None
@@ -168,12 +187,32 @@ class DictationApp:
             # Show transcription progress
             await self.ui.show_transcription_progress("🤖 Transcribing audio with Whisper...")
             
-            # Read audio data from file
-            with open(audio_path, 'rb') as f:
-                audio_data = f.read()
+            # Read audio data from file with error handling
+            try:
+                with open(audio_path, 'rb') as f:
+                    audio_data = f.read()
+            except FileNotFoundError:
+                self.console.print("[red]❌ Audio file not found for transcription.[/red]")
+                return None
+            except PermissionError:
+                self.console.print("[red]❌ Permission denied reading audio file.[/red]")
+                return None
+            except OSError as e:
+                self.console.print(f"[red]❌ Error reading audio file: {e}[/red]")
+                return None
             
             # Use the new async transcribe method
-            result = await self.transcriber.transcribe(audio_data)
+            try:
+                result = await self.transcriber.transcribe(audio_data)
+            except RuntimeError as e:
+                if "model" in str(e).lower():
+                    self.console.print("[red]❌ Whisper model failed to load. Try a smaller model size.[/red]")
+                else:
+                    self.console.print(f"[red]❌ Transcription runtime error: {e}[/red]")
+                return None
+            except Exception as e:
+                self.console.print(f"[red]❌ Transcription failed unexpectedly: {e}[/red]")
+                return None
                 
             if result and result.text.strip():
                 return result
@@ -182,7 +221,8 @@ class DictationApp:
                 return None
                 
         except Exception as e:
-            self.console.print(f"[red]❌ Transcription failed: {e}[/red]")
+            logger.error(f"Transcription process failed: {e}")
+            self.console.print(f"[red]❌ Transcription process failed: {e}[/red]")
             return None
     
     async def _cleanup_text(self, text: str) -> Optional:
@@ -228,11 +268,19 @@ class DictationApp:
     
     def _cleanup_temp_files(self) -> None:
         """Clean up temporary audio files."""
+        if not self._recording_path:
+            return
+            
         try:
-            if self._recording_path and self._recording_path.exists():
+            if self._recording_path.exists():
                 self._recording_path.unlink()
-        except Exception:
-            pass  # Ignore cleanup errors
+                logger.debug(f"Cleaned up temp file: {self._recording_path}")
+        except PermissionError:
+            logger.warning(f"Permission denied deleting temp file: {self._recording_path}")
+        except OSError as e:
+            logger.warning(f"OS error deleting temp file {self._recording_path}: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error deleting temp file {self._recording_path}: {e}")
 
 
 @click.command()

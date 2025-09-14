@@ -318,21 +318,29 @@ class AudioRecorder:
     
     async def _cleanup_resources(self) -> None:
         """Clean up PyAudio resources safely."""
-        try:
-            # Stop and close stream
-            if self._stream:
+        # Stop and close stream with individual exception handling
+        if self._stream:
+            try:
                 if self._stream.is_active():
                     self._stream.stop_stream()
+            except Exception as e:
+                logger.warning(f"Error stopping audio stream: {e}")
+            
+            try:
                 self._stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing audio stream: {e}")
+            finally:
                 self._stream = None
                 
-            # Terminate PyAudio
-            if self._audio:
+        # Terminate PyAudio with separate exception handling
+        if self._audio:
+            try:
                 self._audio.terminate()
+            except Exception as e:
+                logger.warning(f"Error terminating PyAudio: {e}")
+            finally:
                 self._audio = None
-                
-        except Exception as e:
-            logger.warning(f"Error during cleanup: {e}")
     
     async def __aenter__(self) -> "AudioRecorder":
         """Async context manager entry."""
