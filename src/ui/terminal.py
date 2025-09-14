@@ -259,7 +259,7 @@ class TerminalUI:
                 if 1 <= choice_num <= len(results):
                     selected_result = results[choice_num - 1]
                     if not selected_result.error:
-                        self.console.print(f"✅ Selected: {selected_result.provider_name}", style="green")
+                        self.console.print(f"✅ Selected: {selected_result.provider}", style="green")
                         return choice_num - 1  # Return 0-based index
                     else:
                         self.console.print("❌ Cannot select result with error", style="red")
